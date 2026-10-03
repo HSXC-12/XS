@@ -19,6 +19,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function todayStr() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 }
+// 轮次编号：日期 + 北京时间时分（如 2026-10-03 12:05），用于把回信永久锁定到对应那一轮
+function nowStamp() {
+  const d = new Date();
+  const date = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+  const time = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+  return `${date} ${time}`;
+}
 function daysAgo(dateStr) {
   const [y, m, d] = dateStr.split('-').map(Number);
   const then = Date.UTC(y, m - 1, d);
@@ -48,7 +55,8 @@ function stripQuoted(text) {
 function parseRatings(text) {
   const out = [];
   for (const raw of String(text).split(/\r?\n/)) {
-    const line = raw.trim().replace(/^第\s*/, '').replace(/首/g, ' ');
+    // 兼容「第1首 9 感受」/「1首 9 感受」写法，但只处理行首的序号，避免误伤正文里的「首」字
+    const line = raw.trim().replace(/^第\s*(\d{1,2})\s*首/, '$1').replace(/^(\d{1,2})\s*首/, '$1');
     const m = line.match(/^(\d{1,2})\s*[\.、,，:：\)）]?\s*(\d{1,2})(?:\s*[\/／]\s*10)?\s*(.*)$/);
     if (!m) continue;
     const index = Number(m[1]);
@@ -86,15 +94,23 @@ async function fetchFeedbackReplies(history, processedIds) {
             const body = stripQuoted(parsed.text || stripHtml(parsed.html || ''));
             const ratings = parseRatings(body);
             if (!ratings.length) continue;
+            // 优先用主题里的「轮次编号」（日期+时分）精确定位那一轮；老邮件没有编号时才退化为"按日期取最近一轮"
+            const pushIdMatch = subject.match(/(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/);
             const dateMatch = subject.match(/(\d{4}-\d{2}-\d{2})/);
+            const pushId = pushIdMatch ? pushIdMatch[1].trim() : null;
             const date = dateMatch ? dateMatch[1] : null;
-            // 取该日期「最近一次」推送的 5 首（同日多次运行时避免映射到更早的那批）
-            const daySongs = date
-              ? (history.pushed || []).filter((e) => e.date === date).slice(-5)
-              : (history.pushed || []).slice(-5);
+            let daySongs;
+            if (pushId && (history.pushed || []).some((e) => e.pushId === pushId)) {
+              daySongs = (history.pushed || []).filter((e) => e.pushId === pushId);
+            } else if (date) {
+              daySongs = (history.pushed || []).filter((e) => e.date === date).slice(-5);
+            } else {
+              daySongs = (history.pushed || []).slice(-5);
+            }
             for (const r of ratings) {
               const song = daySongs[r.index - 1];
               result.feedback.push({
+                pushId: pushId || song?.pushId || '',
                 date: date || song?.date || todayStr(),
                 index: r.index,
                 title: song?.title || `第${r.index}首`,
@@ -188,24 +204,54 @@ function artistPartsOf(song) {
   return String(song.artist || '').split(/[\/、,，&＋+\s]+/).map(norm).filter((p) => p.length >= 2);
 }
 
+// 歌名必须完整匹配，且不能是"单词中段"命中（避免 "Monody" 命中 "Monodyx"）
+function titleStrictHit(songTitle, candTitle) {
+  const st = String(songTitle || '').trim();
+  if (!st) return false;
+  const ct = String(candTitle || '');
+  const idx = ct.toLowerCase().indexOf(st.toLowerCase());
+  if (idx === -1) return false;
+  const isWordChar = (c) => /[a-z0-9]/i.test(c);
+  const before = idx > 0 ? ct[idx - 1] : '';
+  const after = idx + st.length < ct.length ? ct[idx + st.length] : '';
+  if (before && isWordChar(before) && isWordChar(st[0])) return false;
+  if (after && isWordChar(after) && isWordChar(st[st.length - 1])) return false;
+  return true;
+}
+
+// 歌名前面若多出一个"可疑英文单词"，判为不同曲目（如 "Sin Devil Trigger" ≠ "Devil Trigger"）
+const DECO_WORDS = ['official', 'mv', 'audio', 'lyric', 'lyrics', 'hd', '4k', '8k', 'full', 'version', 'ver', 'op', 'ed', 'ost', 'feat', 'ft', 'by', 'from', 'music', 'song', 'video', 'the', 'feat', 'original'];
+function hasExtraLatinPrefix(songTitle, candTitle, artistParts) {
+  const st = String(songTitle || '').trim();
+  const ct = String(candTitle || '');
+  const idx = ct.toLowerCase().indexOf(st.toLowerCase());
+  if (idx <= 0) return false;
+  const m = ct.slice(0, idx).match(/([A-Za-z][A-Za-z0-9]*)[^A-Za-z0-9]*$/);
+  if (!m) return false; // 前面是中文/括号等 → 不算冲突
+  const word = m[1].toLowerCase();
+  if (artistParts.includes(norm(word))) return false; // 是歌手名 → 允许
+  if (DECO_WORDS.includes(word)) return false; // 是修饰词 → 允许
+  return true; // 多出一个可疑英文单词 → 拒绝
+}
+
 function scoreSearchResult(song, r) {
   const rawTitle = String(r.title || '');
-  const nt = norm(rawTitle);
-  const ntitle = norm(song.title);
-  if (!ntitle || !nt) return -1;
-  // 歌名必须对得上（归一化后互相包含，解决 "TheFatRat" vs "The Fat Rat"）
-  if (!(nt.includes(ntitle) || ntitle.includes(nt))) return -1;
+  const parts = artistPartsOf(song);
+  if (!titleStrictHit(song.title, rawTitle)) return -1;
+  if (hasExtraLatinPrefix(song.title, rawTitle, parts)) return -1;
   if (BAD_HINTS.some((h) => rawTitle.toLowerCase().includes(h))) return -1;
-  // 来源必须可确认：要么演唱者名字出现在标题/上传者里，要么是官方账号上传
   const rawAuthor = String(r.author || '');
   const author = norm(rawAuthor);
-  const artistHit = artistPartsOf(song).some((p) => author.includes(p) || nt.includes(p));
+  const nt = norm(rawTitle);
+  const artistHit = parts.some((p) => author.includes(p) || nt.includes(p));
   const officialAuthor = OFFICIAL_HINTS.some((h) => rawAuthor.toLowerCase().includes(h));
-  if (!artistHit && !officialAuthor) return -1; // 无法确认来源 → 宁可降级成搜索页，也不放错歌
+  const plays = r.play || 0;
+  // 采纳门槛：官方账号上传，或（演唱者对得上 且 播放量够高）——太低播放的转载不采纳
+  if (!officialAuthor && !(artistHit && plays >= 500000)) return -1;
   let s = 10;
-  if (artistHit) s += 10;
-  if (officialAuthor) s += 5;
-  s += Math.min((r.play || 0) / 200000, 8);
+  if (officialAuthor) s += 10;
+  if (artistHit) s += 5;
+  s += Math.min(plays / 200000, 8);
   return s;
 }
 
@@ -225,8 +271,7 @@ async function findLink(song) {
     }
     if (best && bestScore >= 10) {
       const rawAuthor = String(best.author || '');
-      const author = norm(rawAuthor);
-      const official = OFFICIAL_HINTS.some((h) => rawAuthor.toLowerCase().includes(h)) || artistPartsOf(song).some((p) => author.includes(p));
+      const official = OFFICIAL_HINTS.some((h) => rawAuthor.toLowerCase().includes(h));
       return { url: `https://www.bilibili.com/video/${best.bvid}/`, label: official ? '官方版' : '原曲', owner: best.author, views: best.play || 0 };
     }
     return fallbackLink(kw);
@@ -246,6 +291,7 @@ const SYSTEM_PROMPT = `你是「每日推歌」助手。根据用户的种子音
 - 《覆灭重生 Come Alive》Philip Strand/雷声（绝区零 OP）：摇滚/电子、爆发力燃系人声
 - 《最炫民族风》凤凰传奇：华语民族风流行、欢快洗脑、气氛担当
 口味基准：游戏/影视 OST 级制作、强辨识度人声（空灵女声或燃系摇滚嗓）、宏大或高能量编曲；另有一条「欢快华语流行」的快乐轴。更广偏好：华语流行、欧美流行/摇滚、HoYoMix 游戏音乐。
+用户尤其看重歌曲背后的故事与叙事：他的高分大多给到"有厚实背景故事"的作品（游戏剧情曲、影视 OST 等）。选曲请优先有丰富叙事背景的曲目，并在推荐理由里如实点出该作品的故事背景（不得编造）。
 
 【硬性规则】
 1. 5 首中 4 首贴合口味基准，1 首为随机惊喜（风格迥异）；惊喜约每 4 天一次即可。
@@ -254,9 +300,10 @@ const SYSTEM_PROMPT = `你是「每日推歌」助手。根据用户的种子音
 4. 不推种子本身，但可推同艺人/同系列其他作品。
 5. 每首歌给出：语种与风格、与种子的关联（一句话）、推荐理由（一句话）、分类标签。
 6. title 只填歌曲的正式名称：不要把歌手名写进歌名、不要用" - "拼接；artist 只填主要演唱者（多位用"/"连接，最多两位），不要填作曲/制作人。
-7. 「与种子的关联」和「推荐理由」必须基于事实，不得牵强附会：若只是风格相近就如实说"风格相近"，不要编造背景或情绪；不确定的信息不要写。
-8. 不要给歌曲打分，也不要写"听感"——评分与感受由用户本人提供。
-9. 必须参考「用户历史评分」调整选曲：评分高（≥8分）的风格/歌手/类型多推；评分低（≤5分）的方向少推或避开；用户备注里的明确要求（如"最多每周一次"）必须遵守。
+7. 只推荐你确信真实存在、且"歌手—歌曲"对应正确的作品：不要把 A 的歌安在 B 名下，不要凭印象拼凑歌名或编造作品。凡是不确定的，就换一首你更有把握的（宁可选知名作品）。
+8. 「与种子的关联」和「推荐理由」必须基于事实，不得牵强附会：若只是风格相近就如实说"风格相近"，不要编造背景或情绪；不确定的信息不要写。
+9. 不要给歌曲打分，也不要写"听感"——评分与感受由用户本人提供。
+10. 必须参考「用户历史评分」调整选曲：评分高（≥8分）的风格/歌手/类型多推；评分低（≤5分）的方向少推或避开；用户备注里的明确要求（如"最多每周一次"）必须遵守。
 
 【输出格式】只输出 JSON，结构如下：
 {"songs":[{"title":"歌名","artist":"歌手","languageStyle":"语种与风格","seedMatch":"与种子的关联","reason":"推荐理由","category":"分类标签(史诗/燃系摇滚/空灵女声/电子/欢快华语/悲壮抒情/其他)"}]}`;
@@ -298,7 +345,7 @@ async function generateSongs(history, feedback) {
 }
 
 // ---------- 邮件 ----------
-function buildHtml(songs, date) {
+function buildHtml(songs, label) {
   const rows = songs.map((s, i) => `
     <div style="margin-bottom:18px;border-left:4px solid #e50914;padding-left:12px;">
       <div style="font-size:16px;font-weight:bold;">${i + 1} 《${escapeHtml(s.title)}》— ${escapeHtml(s.artist)}</div>
@@ -307,7 +354,7 @@ function buildHtml(songs, date) {
       <div style="margin-top:4px;">在线试听：<a href="${escapeHtml(s.link.url)}">${escapeHtml(s.link.url)}</a>（${escapeHtml(s.link.label)}${s.link.views ? '，播放 ' + fmtViews(s.link.views) : ''}）</div>
     </div>`).join('');
   return `<!DOCTYPE html><html><body style="font-family:'Microsoft YaHei',sans-serif;max-width:640px;margin:auto;padding:16px;">
-    <h2 style="color:#e50914;">🎵 今日推歌（${date}）</h2>${rows}
+    <h2 style="color:#e50914;">🎵 今日推歌（${label}）</h2>${rows}
     <hr>
     <p style="font-size:15px;color:#333;"><b>📝 回复本邮件即可打分</b>，格式：序号 分数 一句感受，例如：</p>
     <pre style="background:#f5f5f5;padding:10px;border-radius:6px;font-size:14px;">1 9 太燃了
@@ -317,7 +364,7 @@ function buildHtml(songs, date) {
   </body></html>`;
 }
 
-async function sendEmail(songs, date) {
+async function sendEmail(songs, label) {
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 465),
@@ -327,8 +374,8 @@ async function sendEmail(songs, date) {
   await transporter.sendMail({
     from: `"每日推歌" <${process.env.SMTP_USER}>`,
     to: process.env.MAIL_TO,
-    subject: `🎵 今日推歌 ${date}（5 首）`,
-    html: buildHtml(songs, date),
+    subject: `🎵 今日推歌 ${label}（5 首）`,
+    html: buildHtml(songs, label),
   });
   console.log('邮件已发送到', process.env.MAIL_TO);
 }
@@ -374,11 +421,12 @@ async function main() {
   }
 
   const date = todayStr();
-  await sendEmail(songs, date);
+  const pushId = nowStamp(); // 轮次编号（日期+时分）
+  await sendEmail(songs, pushId);
 
   // 3) 落库：已推歌单 + 评分样本
   for (const s of songs) {
-    history.pushed.push({ date, title: s.title, artist: s.artist, category: s.category || '其他' });
+    history.pushed.push({ pushId, date, title: s.title, artist: s.artist, category: s.category || '其他' });
   }
   history.pushed = history.pushed.filter((e) => daysAgo(e.date) <= 30);
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2) + '\n');
