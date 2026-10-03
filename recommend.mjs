@@ -1,13 +1,16 @@
 // recommend.mjs — 每日推歌（云端版）
-// 流程：DeepSeek 生成 5 首 → B站搜索核验官方链接 → 邮件发送 → 更新 history.json 去重
+// 流程：读取你回信里的评分 → DeepSeek 据此选 5 首 → B站核验官方链接 → 邮件发送 → 更新 history.json / feedback.json
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
+import { ImapFlow } from 'imapflow';
+import { simpleParser } from 'mailparser';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HISTORY_FILE = path.join(__dirname, 'history.json');
+const FEEDBACK_FILE = path.join(__dirname, 'feedback.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const TZ = 'Asia/Shanghai';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -26,8 +29,92 @@ function daysAgo(dateStr) {
 const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtViews = (v) => (v >= 10000 ? (v / 10000).toFixed(1) + '万' : String(v));
 const stripHtml = (s) => String(s).replace(/<[^>]+>/g, '').trim();
-// 搜索关键词净化：斜杠等分隔符换成空格，避免触发 B站风控 412
 const sanitizeKeyword = (s) => String(s).replace(/[\/\\|,，、;；:：·]/g, ' ').replace(/\s+/g, ' ').trim();
+
+// ---------- 解析你回信里的评分 ----------
+// 只取回信正文（去掉被引用的原文，避免把邮件里的示例"1 9 太燃了"误当成评分）
+function stripQuoted(text) {
+  const out = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    if (/^\s*>/.test(line)) break;
+    if (/^\s*(On .* wrote:|在.*写道[:：]|-{2,}|原始邮件|发件人[:：]|From[:：]\s|回复本邮件即可打分|序号\s*分数)/i.test(line)) break;
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
+function parseRatings(text) {
+  const out = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim().replace(/^第\s*/, '').replace(/首/g, ' ');
+    const m = line.match(/^(\d{1,2})\s*[\.、,，:：\)）]?\s*(\d{1,2})(?:\s*[\/／]\s*10)?\s*(.*)$/);
+    if (!m) continue;
+    const index = Number(m[1]);
+    const score = Number(m[2]);
+    if (index < 1 || index > 5 || score < 0 || score > 10) continue;
+    out.push({ index, score, comment: (m[3] || '').trim() });
+  }
+  return out;
+}
+
+// ---------- 通过 IMAP 读取你的回信 ----------
+async function fetchFeedbackReplies(history, processedIds) {
+  const result = { feedback: [], ids: [] };
+  const client = new ImapFlow({
+    host: process.env.IMAP_HOST || 'imap.qq.com',
+    port: Number(process.env.IMAP_PORT || 993),
+    secure: true,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    logger: false,
+  });
+  await client.connect();
+  try {
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const since = new Date(Date.now() - 7 * 86400000);
+      const uids = await client.search({ since }, { uid: true });
+      if (Array.isArray(uids) && uids.length) {
+        for await (const msg of client.fetch(uids, { envelope: true, source: true }, { uid: true })) {
+          try {
+            const subject = msg.envelope?.subject || '';
+            const messageId = msg.envelope?.messageId || `uid-${msg.uid}`;
+            if (!subject.includes('推歌')) continue;
+            if (processedIds.includes(messageId)) continue;
+            const parsed = await simpleParser(msg.source);
+            const body = stripQuoted(parsed.text || stripHtml(parsed.html || ''));
+            const ratings = parseRatings(body);
+            if (!ratings.length) continue;
+            const dateMatch = subject.match(/(\d{4}-\d{2}-\d{2})/);
+            const date = dateMatch ? dateMatch[1] : null;
+            const daySongs = date
+              ? (history.pushed || []).filter((e) => e.date === date)
+              : (history.pushed || []).slice(-5);
+            for (const r of ratings) {
+              const song = daySongs[r.index - 1];
+              result.feedback.push({
+                date: date || song?.date || todayStr(),
+                index: r.index,
+                title: song?.title || `第${r.index}首`,
+                artist: song?.artist || '',
+                score: r.score,
+                comment: r.comment || '',
+              });
+            }
+            result.ids.push(messageId);
+            console.log(`[feedback] 解析到 ${ratings.length} 条评分（${date || '未知日期'}）`);
+          } catch (e) {
+            console.warn('[feedback] 跳过一封邮件:', e.message);
+          }
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await client.logout().catch(() => {});
+  }
+  return result;
+}
 
 // ---------- B站 wbi 签名 ----------
 const mixinKeyEncTab = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52];
@@ -99,7 +186,7 @@ function scoreSearchResult(song, r) {
   const title = (song.title || '').toLowerCase();
   const fullHit = t.includes(title) || title.includes(t);
   if (!fullHit) return -1;
-  if (BAD_HINTS.some((h) => t.includes(h))) return -1; // 翻唱/剧情版等直接淘汰
+  if (BAD_HINTS.some((h) => t.includes(h))) return -1;
   let s = 10;
   const author = (r.author || '').toLowerCase();
   const artist = (song.artist || '').toLowerCase();
@@ -136,8 +223,8 @@ async function findLink(song) {
   }
 }
 
-// ---------- DeepSeek 生成 ----------
-const SYSTEM_PROMPT = `你是「每日推歌」助手。根据用户的种子音乐与口味基准，每天推荐 5 首歌。
+// ---------- DeepSeek 生成（依据你的评分筛选） ----------
+const SYSTEM_PROMPT = `你是「每日推歌」助手。根据用户的种子音乐、口味基准，以及用户本人的历史评分，每天推荐 5 首歌。
 
 【种子音乐与口味基准】
 - 《野马尘埃 Floating Mist》阿兰/HOYO-MiX（原神）：空灵大气的华语游戏人声、史诗管弦
@@ -152,18 +239,21 @@ const SYSTEM_PROMPT = `你是「每日推歌」助手。根据用户的种子音
 2. 悲壮抒情/催泪类 OST（如《Nightglow》）最多每周推荐 1 次；若「最近7天已推分类」里已有此类，本次不要选。
 3. 不要重复「最近已推」里的歌；尽量选用户大概率没听过的新歌/新发行。
 4. 不推种子本身，但可推同艺人/同系列其他作品。
-5. 每首歌给出：语种与风格、与种子的关联（一句话）、推荐理由（一句话）、评分(1-10，保留0.5)、听感（一句）。
+5. 每首歌给出：语种与风格、与种子的关联（一句话）、推荐理由（一句话）、分类标签。
+6. 不要给歌曲打分，也不要写"听感"——评分与感受由用户本人提供。
+7. 必须参考「用户历史评分」调整选曲：评分高（≥8分）的风格/歌手/类型多推；评分低（≤5分）的方向少推或避开；用户备注里的明确要求（如"最多每周一次"）必须遵守。
 
 【输出格式】只输出 JSON，结构如下：
-{"songs":[{"title":"歌名","artist":"歌手","languageStyle":"语种与风格","seedMatch":"与种子的关联","reason":"推荐理由","rating":8.5,"impression":"听感一句话","category":"分类标签(史诗/燃系摇滚/空灵女声/电子/欢快华语/悲壮抒情/其他)"}]}`;
+{"songs":[{"title":"歌名","artist":"歌手","languageStyle":"语种与风格","seedMatch":"与种子的关联","reason":"推荐理由","category":"分类标签(史诗/燃系摇滚/空灵女声/电子/欢快华语/悲壮抒情/其他)"}]}`;
 
-function userPrompt(history) {
+function userPrompt(history, feedback) {
   const recent = (history.pushed || []).slice(-30).map((e) => `${e.date} ${e.title}-${e.artist}[${e.category}]`).join('；') || '（空）';
   const last7 = (history.pushed || []).filter((e) => daysAgo(e.date) <= 7).map((e) => e.category).join('、') || '（无）';
-  return `今天是 ${todayStr()}（北京时间）。\n最近已推（勿重复）：${recent}\n最近7天已推分类：${last7}\n请推荐 5 首歌，严格按 JSON 格式输出。`;
+  const fb = (feedback || []).slice(-40).map((f) => `${f.date} 《${f.title}》${f.score}分${f.comment ? ' ' + f.comment : ''}`).join('；') || '（暂无，用户还没回复过评分）';
+  return `今天是 ${todayStr()}（北京时间）。\n最近已推（勿重复）：${recent}\n最近7天已推分类：${last7}\n用户历史评分：${fb}\n请推荐 5 首歌，严格按 JSON 格式输出。`;
 }
 
-async function generateSongs(history) {
+async function generateSongs(history, feedback) {
   const res = await fetch('https://api.deepseek.com/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}` },
@@ -171,7 +261,7 @@ async function generateSongs(history) {
       model: 'deepseek-chat',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userPrompt(history) },
+        { role: 'user', content: userPrompt(history, feedback) },
       ],
       response_format: { type: 'json_object' },
       temperature: 0.8,
@@ -196,15 +286,19 @@ async function generateSongs(history) {
 function buildHtml(songs, date) {
   const rows = songs.map((s, i) => `
     <div style="margin-bottom:18px;border-left:4px solid #e50914;padding-left:12px;">
-      <div style="font-size:16px;font-weight:bold;">${i + 1}⃣ 《${escapeHtml(s.title)}》— ${escapeHtml(s.artist)}</div>
+      <div style="font-size:16px;font-weight:bold;">${i + 1} 《${escapeHtml(s.title)}》— ${escapeHtml(s.artist)}</div>
       <div style="color:#555;margin-top:4px;">${escapeHtml(s.languageStyle)}｜${escapeHtml(s.seedMatch)}</div>
       <div style="color:#333;margin-top:4px;">推荐理由：${escapeHtml(s.reason)}</div>
       <div style="margin-top:4px;">在线试听：<a href="${escapeHtml(s.link.url)}">${escapeHtml(s.link.url)}</a>（${escapeHtml(s.link.label)}${s.link.views ? '，播放 ' + fmtViews(s.link.views) : ''}）</div>
-      <div style="color:#e50914;margin-top:4px;">我的评分：${s.rating}/10｜听感：${escapeHtml(s.impression)}</div>
     </div>`).join('');
   return `<!DOCTYPE html><html><body style="font-family:'Microsoft YaHei',sans-serif;max-width:640px;margin:auto;padding:16px;">
     <h2 style="color:#e50914;">🎵 今日推歌（${date}）</h2>${rows}
-    <hr><p style="color:#888;font-size:13px;">评分与听感由 AI 生成，仅供参考。本邮件由 GitHub Actions 每日自动发送。</p>
+    <hr>
+    <p style="font-size:15px;color:#333;"><b>📝 回复本邮件即可打分</b>，格式：序号 分数 一句感受，例如：</p>
+    <pre style="background:#f5f5f5;padding:10px;border-radius:6px;font-size:14px;">1 9 太燃了
+2 8 很喜欢
+3 6 一般</pre>
+    <p style="color:#888;font-size:13px;">你的评分会作为参考样本，用于调整之后的推荐。</p>
   </body></html>`;
 }
 
@@ -212,7 +306,7 @@ async function sendEmail(songs, date) {
   const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 465),
-    secure: process.env.SMTP_SECURE !== 'false', // 465 默认 SSL
+    secure: process.env.SMTP_SECURE !== 'false',
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
   await transporter.sendMail({
@@ -234,12 +328,32 @@ async function main() {
   }
 
   const history = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-  const data = await generateSongs(history);
+  const fb = fs.existsSync(FEEDBACK_FILE) ? JSON.parse(fs.readFileSync(FEEDBACK_FILE, 'utf8')) : { feedback: [], processedIds: [] };
+  fb.feedback = fb.feedback || [];
+  fb.processedIds = fb.processedIds || [];
+
+  // 1) 读取你回信里的评分（失败不影响本次推送）
+  try {
+    const replies = await fetchFeedbackReplies(history, fb.processedIds);
+    if (replies.feedback.length) {
+      fb.feedback.push(...replies.feedback);
+      fb.processedIds.push(...replies.ids);
+      fb.processedIds = fb.processedIds.slice(-300);
+      console.log(`本次新增 ${replies.feedback.length} 条评分样本`);
+    } else {
+      console.log('没有新的评分回信');
+    }
+  } catch (e) {
+    console.warn('读取邮件回复失败（不影响本次推送）:', e.message);
+  }
+
+  // 2) 生成推荐（带上你的历史评分）
+  const data = await generateSongs(history, fb.feedback);
   const songs = data.songs;
   if (!Array.isArray(songs) || songs.length === 0) throw new Error('LLM 未返回有效歌单');
 
   for (const s of songs) {
-    await sleep(1200); // 相邻搜索间隔，避免风控
+    await sleep(1200);
     s.link = await findLink(s);
     console.log(`[link] ${s.title} -> ${s.link.url} (${s.link.label})`);
   }
@@ -247,11 +361,13 @@ async function main() {
   const date = todayStr();
   await sendEmail(songs, date);
 
+  // 3) 落库：已推歌单 + 评分样本
   for (const s of songs) {
     history.pushed.push({ date, title: s.title, artist: s.artist, category: s.category || '其他' });
   }
   history.pushed = history.pushed.filter((e) => daysAgo(e.date) <= 30);
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2) + '\n');
+  fs.writeFileSync(FEEDBACK_FILE, JSON.stringify(fb, null, 2) + '\n');
   console.log('完成：', songs.map((s) => s.title).join(' / '));
 }
 
