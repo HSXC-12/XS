@@ -30,6 +30,8 @@ const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&a
 const fmtViews = (v) => (v >= 10000 ? (v / 10000).toFixed(1) + '万' : String(v));
 const stripHtml = (s) => String(s).replace(/<[^>]+>/g, '').trim();
 const sanitizeKeyword = (s) => String(s).replace(/[\/\\|,，、;；:：·]/g, ' ').replace(/\s+/g, ' ').trim();
+// 归一化：去掉空格/标点/大小写差异，用于歌名与歌手比对（解决 "TheFatRat" vs "The Fat Rat" 这类问题）
+const norm = (s) => String(s || '').toLowerCase().replace(/[\s\-–—_~·・,，。.、()（）\[\]【】《》"'"'!！?？:：/\\]/g, '');
 
 // ---------- 解析你回信里的评分 ----------
 // 只取回信正文（去掉被引用的原文，避免把邮件里的示例"1 9 太燃了"误当成评分）
@@ -86,8 +88,9 @@ async function fetchFeedbackReplies(history, processedIds) {
             if (!ratings.length) continue;
             const dateMatch = subject.match(/(\d{4}-\d{2}-\d{2})/);
             const date = dateMatch ? dateMatch[1] : null;
+            // 取该日期「最近一次」推送的 5 首（同日多次运行时避免映射到更早的那批）
             const daySongs = date
-              ? (history.pushed || []).filter((e) => e.date === date)
+              ? (history.pushed || []).filter((e) => e.date === date).slice(-5)
               : (history.pushed || []).slice(-5);
             for (const r of ratings) {
               const song = daySongs[r.index - 1];
@@ -181,17 +184,27 @@ async function biliSearch(keyword) {
 const OFFICIAL_HINTS = ['官方', 'official', '音乐', 'music', 'hoyo-mix', 'hoyomix', '崩坏星穹铁道', '绝区零', '崩坏3', '原神', '米哈游', '凤凰传奇', '工作室'];
 const BAD_HINTS = ['翻唱', 'cover', 'remix', '混剪', '剪辑', '高清修复', '录音棚', '剧情版', '饭拍', '现场', 'live', '伴奏'];
 
+function artistPartsOf(song) {
+  return String(song.artist || '').split(/[\/、,，&＋+\s]+/).map(norm).filter((p) => p.length >= 2);
+}
+
 function scoreSearchResult(song, r) {
-  const t = (r.title || '').toLowerCase();
-  const title = (song.title || '').toLowerCase();
-  const fullHit = t.includes(title) || title.includes(t);
-  if (!fullHit) return -1;
-  if (BAD_HINTS.some((h) => t.includes(h))) return -1;
+  const rawTitle = String(r.title || '');
+  const nt = norm(rawTitle);
+  const ntitle = norm(song.title);
+  if (!ntitle || !nt) return -1;
+  // 歌名必须对得上（归一化后互相包含，解决 "TheFatRat" vs "The Fat Rat"）
+  if (!(nt.includes(ntitle) || ntitle.includes(nt))) return -1;
+  if (BAD_HINTS.some((h) => rawTitle.toLowerCase().includes(h))) return -1;
+  // 来源必须可确认：要么演唱者名字出现在标题/上传者里，要么是官方账号上传
+  const rawAuthor = String(r.author || '');
+  const author = norm(rawAuthor);
+  const artistHit = artistPartsOf(song).some((p) => author.includes(p) || nt.includes(p));
+  const officialAuthor = OFFICIAL_HINTS.some((h) => rawAuthor.toLowerCase().includes(h));
+  if (!artistHit && !officialAuthor) return -1; // 无法确认来源 → 宁可降级成搜索页，也不放错歌
   let s = 10;
-  const author = (r.author || '').toLowerCase();
-  const artist = (song.artist || '').toLowerCase();
-  if (artist && (author.includes(artist) || artist.includes(author))) s += 8;
-  if (OFFICIAL_HINTS.some((h) => (r.author || '').toLowerCase().includes(h))) s += 5;
+  if (artistHit) s += 10;
+  if (officialAuthor) s += 5;
   s += Math.min((r.play || 0) / 200000, 8);
   return s;
 }
@@ -211,9 +224,9 @@ async function findLink(song) {
       if (sc > bestScore) { bestScore = sc; best = r; }
     }
     if (best && bestScore >= 10) {
-      const author = (best.author || '').toLowerCase();
-      const artist = (song.artist || '').toLowerCase();
-      const official = OFFICIAL_HINTS.some((h) => author.includes(h)) || (artist && author.includes(artist));
+      const rawAuthor = String(best.author || '');
+      const author = norm(rawAuthor);
+      const official = OFFICIAL_HINTS.some((h) => rawAuthor.toLowerCase().includes(h)) || artistPartsOf(song).some((p) => author.includes(p));
       return { url: `https://www.bilibili.com/video/${best.bvid}/`, label: official ? '官方版' : '原曲', owner: best.author, views: best.play || 0 };
     }
     return fallbackLink(kw);
@@ -240,8 +253,10 @@ const SYSTEM_PROMPT = `你是「每日推歌」助手。根据用户的种子音
 3. 不要重复「最近已推」里的歌；尽量选用户大概率没听过的新歌/新发行。
 4. 不推种子本身，但可推同艺人/同系列其他作品。
 5. 每首歌给出：语种与风格、与种子的关联（一句话）、推荐理由（一句话）、分类标签。
-6. 不要给歌曲打分，也不要写"听感"——评分与感受由用户本人提供。
-7. 必须参考「用户历史评分」调整选曲：评分高（≥8分）的风格/歌手/类型多推；评分低（≤5分）的方向少推或避开；用户备注里的明确要求（如"最多每周一次"）必须遵守。
+6. title 只填歌曲的正式名称：不要把歌手名写进歌名、不要用" - "拼接；artist 只填主要演唱者（多位用"/"连接，最多两位），不要填作曲/制作人。
+7. 「与种子的关联」和「推荐理由」必须基于事实，不得牵强附会：若只是风格相近就如实说"风格相近"，不要编造背景或情绪；不确定的信息不要写。
+8. 不要给歌曲打分，也不要写"听感"——评分与感受由用户本人提供。
+9. 必须参考「用户历史评分」调整选曲：评分高（≥8分）的风格/歌手/类型多推；评分低（≤5分）的方向少推或避开；用户备注里的明确要求（如"最多每周一次"）必须遵守。
 
 【输出格式】只输出 JSON，结构如下：
 {"songs":[{"title":"歌名","artist":"歌手","languageStyle":"语种与风格","seedMatch":"与种子的关联","reason":"推荐理由","category":"分类标签(史诗/燃系摇滚/空灵女声/电子/欢快华语/悲壮抒情/其他)"}]}`;
